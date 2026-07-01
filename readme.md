@@ -1,9 +1,6 @@
 
 
-[Дом](home/readme.md)
-
-[Audio](audio/readme.md)
-
-[Аквариум](aquarium/readme.md)
-
-[Разное](tuttifrutti/readme.md)
+* [Дом](home/readme.md)
+* [Audio](audio/readme.md)
+* [Аквариум](aquarium/readme.md)
+* [Разное](tuttifrutti/readme.md)
