@@ -184,3 +184,174 @@
    * Укажите тактирование от ядра DSP (**Clock Domain**), жестко привязанного к вашему физическому мастер-клоку 12.288 МГц.
 6. Скомпилируйте проект (**Link-Compile-Download**) и зашейте его в EEPROM платы для автозагрузки (Self-Boot).
 
+# Дополнительное руководство: Сборка Bluetooth High-Res (LDAC / aptX HD) на Orange Pi PC+
+
+В данном руководстве описан процесс полной очистки системы от встроенного Bluetooth и сборка из исходных кодов продвинутого аудио-демона `BlueALSA` с поддержкой аудиофильских кодеков **Sony LDAC** (24 бит / 96 кГц) и **Qualcomm aptX HD** (24 бит / 48 кГц).
+
+---
+
+## 1. Аппаратная подготовка и отключение встроенного радиомодуля
+
+Встроенный чип *AP6212* на Orange Pi PC+ физически не способен удерживать поток LDAC (990 кбит/с). Необходимо использовать внешний USB-адаптер на чипе **Realtek RTL8761B** (Bluetooth 5.0). Чтобы они не конфликтовали, встроенный чип нужно отключить.
+
+1. Откройте черный список модулей ядра:
+   ```bash
+   sudo nano /etc/modprobe.d/blacklist-internal-bt.conf
+   ```
+2. Добавьте строки для блокировки встроенных драйверов связи Allwinner:
+   ```text
+   blacklist btsdio
+   blacklist hci_uart
+   blacklist sunxi_bt
+   ```
+3. Подключите внешний USB-адаптер RTL8761B в любой свободный USB-порт Orange Pi PC+ и перезагрузите плату:
+   ```bash
+   sudo reboot
+   ```
+4. Убедитесь, что система видит новый адаптер как `hci0`:
+   ```bash
+   hciconfig -a
+   ```
+
+---
+
+## 2. Сборка библиотек декодеров из исходных кодов
+
+Официальные репозитории дистрибутивов Linux не содержат бинарные пакеты LDAC и aptX из-за лицензионных ограничений, поэтому мы компилируем их открытые исходные коды (AOSP) прямо на плате.
+
+### Шаг 2.1. Установка базовых инструментов сборки
+```bash
+sudo apt update
+sudo apt install -y git build-essential cmake debhelper pkg-config \
+libasound2-dev libbluetooth-dev libdbus-1-dev libglib2.0-dev \
+libtool autoconf automake libsbc-dev
+```
+
+### Шаг 2.2. Сборка кодека Sony LDAC
+```bash
+git clone https://github.com
+cd ldacBT
+git submodule update --init
+mkdir build && cd build
+cmake -DCMAKE_INSTALL_PREFIX=/usr -DINSTALL_LIBDIR=lib ..
+make
+sudo make install
+cd ../..
+```
+
+### Шаг 2.3. Сборка кодека Qualcomm aptX / aptX HD
+```bash
+git clone https://github.com
+cd libfreeaptx
+make
+sudo make install
+cd ..
+```
+*После установки выполните команду обновления ссылок на разделяемые библиотеки:*
+```bash
+sudo ldconfig
+```
+
+---
+
+## 3. Компиляция и установка BlueALSA с поддержкой High-Res
+
+Теперь мы собираем сам аудио-демон, указывая компилятору флаги активации установленных библиотек.
+
+1. Клонируйте официальный репозиторий проекта `bluez-alsa`:
+   ```bash
+   git clone https://github.com
+   cd bluez-alsa
+   ```
+2. Сгенерируйте скрипты конфигурации:
+   ```bash
+   autoreconf --install
+   mkdir build && cd build
+   ```
+3. Запустите конфигуратор с **полным набором High-Res флагов**:
+   ```bash
+   ../configure --enable-ldac --enable-aptx --enable-aptx-hd --with-libfreeaptx --enable-systemd --enable-cli
+   ```
+   *Убедитесь, что в финальном выводе скрипта напротив строк `LDAC`, `aptX` и `aptX HD` стоит значение `yes`.*
+4. Скомпилируйте и установите демон в систему:
+   ```bash
+   make
+   sudo make install
+   ```
+
+---
+
+## 4. Автоматизация служб и сопряжение со смартфоном
+
+### Шаг 4.1. Настройка автозапуска BlueALSA
+1. Создайте системную службу для демона:
+   ```bash
+   sudo nano /etc/systemd/system/bluealsa.service
+   ```
+2. Вставьте конфигурацию, принудительно активирующую кодеки в режиме аудио-приемника (Sink):
+   ```ini
+   [Unit]
+   Description=BlueALSA High-Res Audio Daemon
+   After=bluetooth.target
+   Requires=bluetooth.target
+
+   [Service]
+   Type=dbus
+   BusName=org.bluealsa
+   ExecStart=/usr/local/bin/bluealsad -p a2dp-sink -c ldac -c aptx-hd
+   Restart=on-failure
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+
+### Шаг 4.2. Настройка автоматической трансляции в I2S Slave
+Чтобы поток данных, принятый по Bluetooth, автоматически перенаправлялся на пины I2S вашей звуковой карты без ручного ввода команд, создаем вторую службу-транслятор.
+
+1. Создайте файл службы:
+   ```bash
+   sudo nano /etc/systemd/system/bluealsa-aplay.service
+   ```
+2. Вставьте конфигурацию (где `hw:1,0` — это имя вашей карты I2S Slave):
+   ```ini
+   [Unit]
+   Description=BlueALSA Player to I2S Slave
+   After=bluealsa.service
+   Requires=bluealsa.service
+
+   [Service]
+   ExecStart=/usr/local/bin/bluealsa-aplay --device=hw:1,0 00:00:00:00:00:00
+   Restart=on-failure
+
+   [Install]
+   WantedBy=multi-user.target
+   ```
+3. Активируйте и запустите обе службы:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable bluealsa bluealsa-aplay
+   sudo systemctl start bluealsa bluealsa-aplay
+   ```
+
+### Шаг 4.3. Первичное сопряжение телефона
+1. Войдите в консоль управления Bluetooth:
+   ```bash
+   sudo bluetoothctl
+   ```
+2. Введите команды для перевода USB-донгла в режим сопряжения:
+   ```text
+   power on
+   agent on
+   default-agent
+   discoverable on
+   pairable on
+   ```
+3. Откройте настройки Bluetooth на смартфоне, найдите Orange Pi и нажмите «Подключиться».
+4. В консоли платы появится запрос на сопряжение, введите `yes` и нажмите `Enter`.
+5. Добавьте ваш телефон в доверенные устройства, чтобы плата подключалась к нему автоматически (замените `XX:XX...` на реальный MAC-адрес вашего телефона, который отобразится в консоли):
+   ```text
+   trust XX:XX:XX:XX:XX:XX
+   exit
+   ```
+
+После этого в шторке смартфона (в разделе настроек Bluetooth-устройства) активируйте ползунок **LDAC** или **aptX HD**. Теперь при запуске любого плеера на телефоне аудиопоток высокого разрешения полетит напрямую в процессор, а оттуда — в Slave-режиме через I2S в ADAU1467 [см. пред. ответ].
